@@ -1,9 +1,15 @@
-const socket = io();
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
 
-const MILLION_EVENT_SCORE = 1_000_000;
-const celebratedMillionPlayers = new Set();
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
 
-let audioContext = null;
+app.use(express.static("public"));
+
+const WIN_SCORE = 10_000_000;
+const MAX_PLAYERS = 6;
 
 const cooldowns = {
   mine: 120,
@@ -15,317 +21,215 @@ const cooldowns = {
   jackpot: 7000
 };
 
-function initAudio() {
-  if (!audioContext) {
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+let players = {};
+let logs = [];
+let winner = null;
+
+function cleanName(name) {
+  return String(name || "")
+    .replace(/[<>]/g, "")
+    .trim()
+    .slice(0, 16) || "Player";
+}
+
+function addLog(text) {
+  logs.push(text);
+  if (logs.length > 12) logs.shift();
+}
+
+function getPlayersArray() {
+  return Object.values(players).sort((a, b) => b.score - a.score);
+}
+
+function getState() {
+  return {
+    players: getPlayersArray(),
+    logs,
+    winner,
+    winScore: WIN_SCORE,
+    maxPlayers: MAX_PLAYERS
+  };
+}
+
+function emitState() {
+  io.emit("state", getState());
+}
+
+function checkWinner(player) {
+  if (!winner && player.score >= WIN_SCORE) {
+    winner = player.name;
+    addLog(`${player.name} 10.000.000 TREEZ yaptı ve masayı kazandı!`);
   }
 }
 
-function playTone(freq, duration, type = "sine", volume = 0.08) {
-  initAudio();
+function canUse(player, type) {
+  const now = Date.now();
+  const cooldown = cooldowns[type] || 500;
 
-  const now = audioContext.currentTime;
-  const osc = audioContext.createOscillator();
-  const gain = audioContext.createGain();
+  if (player.lastAction[type] && now - player.lastAction[type] < cooldown) {
+    return false;
+  }
 
-  osc.type = type;
-  osc.frequency.setValueAtTime(freq, now);
-
-  gain.gain.setValueAtTime(volume, now);
-  gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
-
-  osc.connect(gain);
-  gain.connect(audioContext.destination);
-
-  osc.start(now);
-  osc.stop(now + duration);
+  player.lastAction[type] = now;
+  return true;
 }
 
-function playCoinSound() {
-  playTone(900, 0.08, "square", 0.06);
+function saveBeforeScores() {
+  const before = {};
 
-  setTimeout(() => {
-    playTone(1350, 0.08, "triangle", 0.05);
-  }, 45);
+  Object.values(players).forEach(player => {
+    before[player.id] = player.score;
+  });
 
-  setTimeout(() => {
-    playTone(1800, 0.06, "sine", 0.04);
-  }, 90);
+  return before;
 }
 
-function playRiskSound() {
-  playTone(180, 0.14, "sawtooth", 0.06);
-
-  setTimeout(() => {
-    playTone(420, 0.18, "sawtooth", 0.05);
-  }, 70);
+function updateLastGains(before) {
+  Object.values(players).forEach(player => {
+    player.score = Math.max(0, Math.floor(player.score));
+    player.lastGain = player.score - (before[player.id] || 0);
+  });
 }
 
-function playJackpotSound() {
-  playTone(520, 0.08, "square", 0.06);
-  setTimeout(() => playTone(780, 0.08, "square", 0.06), 80);
-  setTimeout(() => playTone(1040, 0.08, "square", 0.06), 160);
-  setTimeout(() => playTone(1560, 0.16, "triangle", 0.07), 240);
-}
-
-function playExplosionSound() {
-  playTone(120, 0.12, "sawtooth", 0.09);
-  setTimeout(() => playTone(220, 0.12, "sawtooth", 0.08), 70);
-  setTimeout(() => playTone(80, 0.22, "square", 0.07), 140);
-  setTimeout(() => playTone(900, 0.08, "triangle", 0.06), 230);
-}
-
-function setName() {
-  const name = document.getElementById("nameInput").value;
-  socket.emit("setName", name);
-  playCoinSound();
-}
-
-function sendAction(type, event) {
-  const button = event.currentTarget;
-
-  if (button.classList.contains("cooling")) {
+io.on("connection", (socket) => {
+  if (Object.keys(players).length >= MAX_PLAYERS) {
+    socket.emit("roomFull");
+    socket.disconnect();
     return;
   }
 
-  socket.emit("action", type);
+  players[socket.id] = {
+    id: socket.id,
+    name: "Player",
+    score: 0,
+    lastGain: 0,
+    lastAction: {}
+  };
 
-  if (type === "mine") {
-    playCoinSound();
-    createFloatingText(event.clientX, event.clientY, "+TREEZ");
-  } else if (type === "jackpot") {
-    playJackpotSound();
-    createFloatingText(event.clientX, event.clientY, "JACKPOT?");
-  } else {
-    playRiskSound();
-    createFloatingText(event.clientX, event.clientY, "RISK");
-  }
+  addLog("Yeni oyuncu masaya katıldı.");
+  emitState();
 
-  createParticles(event.clientX, event.clientY);
-  startCooldown(button, cooldowns[type] || 500);
-}
+  socket.on("setName", (name) => {
+    if (!players[socket.id]) return;
 
-function startCooldown(button, duration) {
-  const fill = button.querySelector(".cooldownFill");
-  if (!fill) return;
-
-  button.classList.add("cooling");
-
-  const start = performance.now();
-
-  function animate(now) {
-    const elapsed = now - start;
-    const progress = Math.min(elapsed / duration, 1);
-    const remaining = 100 - progress * 100;
-
-    fill.style.width = `${remaining}%`;
-
-    if (progress < 1) {
-      requestAnimationFrame(animate);
-    } else {
-      fill.style.width = "0%";
-      button.classList.remove("cooling");
-    }
-  }
-
-  fill.style.width = "100%";
-  requestAnimationFrame(animate);
-}
-
-function formatScore(num) {
-  return Math.floor(num).toLocaleString("tr-TR");
-}
-
-function createFloatingText(x, y, text) {
-  const el = document.createElement("div");
-  el.className = "floating";
-  el.innerText = text;
-  el.style.left = `${x}px`;
-  el.style.top = `${y}px`;
-
-  document.body.appendChild(el);
-
-  setTimeout(() => {
-    el.remove();
-  }, 900);
-}
-
-function createParticles(x, y) {
-  for (let i = 0; i < 20; i++) {
-    const p = document.createElement("div");
-    p.className = "particle";
-
-    const angle = Math.random() * Math.PI * 2;
-    const distance = 40 + Math.random() * 70;
-
-    const px = Math.cos(angle) * distance;
-    const py = Math.sin(angle) * distance;
-
-    p.style.left = `${x}px`;
-    p.style.top = `${y}px`;
-    p.style.setProperty("--x", `${px}px`);
-    p.style.setProperty("--y", `${py}px`);
-
-    document.body.appendChild(p);
-
-    setTimeout(() => {
-      p.remove();
-    }, 650);
-  }
-}
-
-function createExplosion(x, y) {
-  for (let i = 0; i < 90; i++) {
-    const p = document.createElement("div");
-    p.className = "explosionParticle";
-
-    const angle = Math.random() * Math.PI * 2;
-    const distance = 80 + Math.random() * 260;
-
-    const px = Math.cos(angle) * distance;
-    const py = Math.sin(angle) * distance;
-
-    p.style.left = `${x}px`;
-    p.style.top = `${y}px`;
-    p.style.setProperty("--x", `${px}px`);
-    p.style.setProperty("--y", `${py}px`);
-
-    document.body.appendChild(p);
-
-    setTimeout(() => {
-      p.remove();
-    }, 1000);
-  }
-}
-
-function triggerMillionEvent(playerName) {
-  const box = document.getElementById("megaEvent");
-  if (!box) return;
-
-  box.innerHTML = `${playerName}<br>1.000.000 TREEZ!`;
-  box.classList.remove("show");
-
-  void box.offsetWidth;
-
-  box.classList.add("show");
-
-  document.body.classList.add("screenShake");
-  playExplosionSound();
-
-  createExplosion(window.innerWidth / 2, window.innerHeight / 2);
-
-  setTimeout(() => {
-    box.classList.remove("show");
-    document.body.classList.remove("screenShake");
-  }, 1500);
-}
-
-function updateMoneyBoard(players) {
-  const board = document.getElementById("moneyBoard");
-  if (!board) return;
-
-  let html = `<div class="moneyBoardTitle">CANLI TREEZ TABLOSU</div>`;
-
-  players.forEach((player, index) => {
-    const rowClass = index === 0 ? "moneyRow leaderRow" : "moneyRow";
-    const nameClass = index === 0 ? "fireLeader" : index === 1 ? "rgbRunner" : "normalName";
-
-    html += `
-      <div class="${rowClass}">
-        <span class="${nameClass}">${index + 1}. ${player.name}</span>
-        <strong>${formatScore(player.score)}</strong>
-      </div>
-    `;
+    players[socket.id].name = cleanName(name);
+    addLog(`${players[socket.id].name} ismini kaydetti.`);
+    emitState();
   });
 
-  board.innerHTML = html;
-}
+  socket.on("action", (type) => {
+    const player = players[socket.id];
 
-function spawnBackgroundCoin() {
-  const layer = document.getElementById("coinRain");
-  if (!layer) return;
+    if (!player) return;
+    if (winner) return;
+    if (!canUse(player, type)) return;
 
-  const coin = document.createElement("div");
-  coin.className = "bgCoin";
-  coin.innerText = "T";
+    const before = saveBeforeScores();
 
-  const size = 22 + Math.random() * 24;
+    if (type === "mine") {
+      const gain = 25 + Math.floor(Math.random() * 21) + Math.floor(player.score * 0.003);
+      player.score += Math.max(25, gain);
+      addLog(`${player.name} TREEZ kazdı.`);
+    }
 
-  coin.style.width = `${size}px`;
-  coin.style.height = `${size}px`;
-  coin.style.left = `${Math.random() * 100}%`;
-  coin.style.animationDuration = `${4 + Math.random() * 5}s`;
+    if (type === "greed") {
+      if (Math.random() < 0.68) {
+        player.score = Math.max(2, player.score * 2);
+        addLog(`${player.name} Katla yaptı. Skor x2 oldu.`);
+      } else {
+        player.score = Math.floor(player.score * 0.45);
+        addLog(`${player.name} Katla yaparken patladı. Skor düştü.`);
+      }
+    }
 
-  layer.appendChild(coin);
+    if (type === "mega") {
+      if (player.score < 50) {
+        addLog(`${player.name} Mega Pump için en az 50 TREEZ lazım.`);
+      } else if (Math.random() < 0.44) {
+        player.score *= 5;
+        addLog(`${player.name} Mega Pump tuttu. Skor x5 oldu.`);
+      } else {
+        player.score = Math.floor(player.score * 0.15);
+        addLog(`${player.name} Mega Pump'ta tokat yedi.`);
+      }
+    }
 
-  setTimeout(() => {
-    coin.remove();
-  }, 9500);
-}
+    if (type === "steal") {
+      const targets = getPlayersArray().filter(p => p.id !== player.id && p.score > 0);
 
-setInterval(spawnBackgroundCoin, 450);
+      if (targets.length === 0) {
+        addLog(`${player.name} çalacak oyuncu bulamadı.`);
+      } else {
+        const target = targets[Math.floor(Math.random() * targets.length)];
+        const amount = Math.max(1, Math.floor(target.score * 0.24));
 
-socket.on("roomFull", () => {
-  document.body.innerHTML = `
-    <div style="color:white;text-align:center;margin-top:120px;font-family:Arial">
-      <h1>Oda Dolu</h1>
-      <p>Max 6 oyuncu girebilir.</p>
-    </div>
-  `;
+        target.score -= amount;
+        player.score += amount;
+
+        addLog(`${player.name}, ${target.name} oyuncusundan ${amount} TREEZ çaldı.`);
+      }
+    }
+
+    if (type === "tax") {
+      const leader = getPlayersArray()[0];
+
+      if (!leader || leader.id === player.id || leader.score <= 0) {
+        addLog(`${player.name} liderden vergi alamadı.`);
+      } else {
+        const amount = Math.max(1, Math.floor(leader.score * 0.18));
+
+        leader.score -= amount;
+        player.score += amount;
+
+        addLog(`${player.name}, lider ${leader.name} oyuncusundan ${amount} TREEZ vergi aldı.`);
+      }
+    }
+
+    if (type === "rug") {
+      if (player.score < 100) {
+        addLog(`${player.name} Rug Pull için en az 100 TREEZ lazım.`);
+      } else if (Math.random() < 0.38) {
+        const victims = getPlayersArray().filter(p => p.id !== player.id);
+
+        victims.forEach(victim => {
+          const loss = Math.floor(victim.score * 0.32);
+          victim.score -= loss;
+          player.score += Math.floor(loss * 0.55);
+        });
+
+        addLog(`${player.name} Rug Pull yaptı. Masa karıştı.`);
+      } else {
+        player.score = 0;
+        addLog(`${player.name} Rug Pull denedi ama kendi sıfırlandı.`);
+      }
+    }
+
+    if (type === "jackpot") {
+      if (player.score < 500) {
+        addLog(`${player.name} Jackpot için en az 500 TREEZ lazım.`);
+      } else if (Math.random() < 0.22) {
+        player.score *= 20;
+        addLog(`${player.name} Jackpot vurdu. Skor x20 oldu.`);
+      } else {
+        player.score = Math.floor(player.score * 0.05);
+        addLog(`${player.name} Jackpot kaybetti. Kasa yine kazandı.`);
+      }
+    }
+
+    updateLastGains(before);
+    checkWinner(player);
+    emitState();
+  });
+
+  socket.on("disconnect", () => {
+    delete players[socket.id];
+    addLog("Bir oyuncu masadan çıktı.");
+    emitState();
+  });
 });
 
-socket.on("state", (state) => {
-  const playersDiv = document.getElementById("players");
-  const logsDiv = document.getElementById("logs");
-  const winnerBox = document.getElementById("winnerBox");
-  const warningBox = document.getElementById("warningBox");
+const PORT = process.env.PORT || 3000;
 
-  if (!playersDiv || !logsDiv || !winnerBox || !warningBox) return;
-
-  playersDiv.innerHTML = "";
-  logsDiv.innerHTML = "";
-
-  updateMoneyBoard(state.players);
-
-  warningBox.innerHTML = `${state.players.length}/6 oyuncu masada | Hedef: ${formatScore(state.winScore)} TREEZ`;
-
-  if (state.winner) {
-    winnerBox.innerHTML = `Kazanan: ${state.winner}`;
-  } else {
-    winnerBox.innerHTML = "";
-  }
-
-  state.players.forEach((player, index) => {
-    const gainText = player.lastGain > 0
-      ? `+${formatScore(player.lastGain)} TREEZ`
-      : player.lastGain < 0
-        ? `${formatScore(player.lastGain)} TREEZ`
-        : "";
-
-    const nameClass = index === 0 ? "fireLeader" : index === 1 ? "rgbRunner" : "normalName";
-    const cardClass = index === 0 ? "player leaderCard" : index === 1 ? "player secondCard" : "player";
-    const progress = Math.min((player.score / state.winScore) * 100, 100);
-
-    if (player.score >= MILLION_EVENT_SCORE && !celebratedMillionPlayers.has(player.id)) {
-      celebratedMillionPlayers.add(player.id);
-      triggerMillionEvent(player.name);
-    }
-
-    playersDiv.innerHTML += `
-      <div class="${cardClass}">
-        <div class="${nameClass}">${index + 1}. ${player.name}</div>
-        <div class="score">${formatScore(player.score)} TREEZ</div>
-        <div class="gain">${gainText}</div>
-        <div class="progressWrap">
-          <div class="progressFill" style="width:${progress}%"></div>
-        </div>
-      </div>
-    `;
-  });
-
-  state.logs.slice().reverse().forEach((log) => {
-    logsDiv.innerHTML += `
-      <div class="log">${log}</div>
-    `;
-  });
+server.listen(PORT, () => {
+  console.log(`TREEZCOIN çalışıyor: http://localhost:${PORT}`);
 });
